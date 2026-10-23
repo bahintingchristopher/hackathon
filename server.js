@@ -5,6 +5,8 @@ const { Server } = require('socket.io');
 const { Octokit } = require('@octokit/rest');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 
 const app = express();
 const server = http.createServer(app);
@@ -28,6 +30,87 @@ const teamMetrics = {};
 
 const processedDeliveries = new Set();
 const MAX_TRACKED_DELIVERIES = 500;
+
+const STATE_DIR =
+  process.env.STATE_DIR || path.join(os.homedir(), '.github-hackathon-tracker');
+const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, 'state.json');
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      return;
+    }
+
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+
+    if (state.teamMetrics && typeof state.teamMetrics === 'object') {
+      Object.assign(teamMetrics, state.teamMetrics);
+    }
+
+    if (Array.isArray(state.processedDeliveries)) {
+      for (const deliveryId of state.processedDeliveries.slice(-MAX_TRACKED_DELIVERIES)) {
+        if (typeof deliveryId === 'string') {
+          processedDeliveries.add(deliveryId);
+        }
+      }
+    }
+
+    console.log(
+      `[State] Loaded ${Object.keys(teamMetrics).length} team(s) and ${processedDeliveries.size} delivery record(s)`
+    );
+  } catch (err) {
+    console.error('[State] Failed to load persisted state:', err.message);
+  }
+}
+
+function persistState() {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+
+    const state = {
+      teamMetrics,
+      processedDeliveries: Array.from(processedDeliveries),
+      savedAt: new Date().toISOString(),
+    };
+    const serialized = JSON.stringify(state, null, 2);
+    const tempFile = `${STATE_FILE}.tmp`;
+
+    fs.writeFileSync(tempFile, serialized);
+
+    try {
+      fs.renameSync(tempFile, STATE_FILE);
+    } catch (err) {
+      fs.writeFileSync(STATE_FILE, serialized);
+      fs.rmSync(tempFile, { force: true });
+    }
+  } catch (err) {
+    console.error('[State] Failed to persist state:', err.message);
+  }
+}
+
+loadState();
+
+function calculateSummary(metrics) {
+  const teams = Object.values(metrics);
+
+  return {
+    totalProjects: teams.length,
+    totalCommits: teams.reduce((sum, team) => sum + (Number(team.totalCommits) || 0), 0),
+    totalVideos: teams.filter((team) => team.hasVideo).length,
+    totalPresentations: teams.filter((team) => team.hasPresentation).length,
+  };
+}
+
+function buildMetricsPayload() {
+  return {
+    teams: teamMetrics,
+    summary: calculateSummary(teamMetrics),
+  };
+}
+
+function broadcastMetrics() {
+  io.emit('metrics-updated', buildMetricsPayload());
+}
 
 function normalizePayload(req) {
   const body = req.body || {};
@@ -74,41 +157,128 @@ function rememberDelivery(deliveryId) {
 }
 
 /**
- * Check if specific files or metadata exist in the repository
+ * Detect artifact files from the push payload. This is a fallback for private
+ * repos the GITHUB_TOKEN cannot inspect; it only sets positive flags.
+ */
+function detectPayloadSignals(body) {
+  const signals = {
+    hasReadme: false,
+    hasVideo: false,
+    hasPresentation: false,
+  };
+
+  const changedFiles = new Set();
+  const commits = Array.isArray(body?.commits) ? body.commits : [];
+
+  for (const commit of commits) {
+    for (const file of Array.isArray(commit?.added) ? commit.added : []) {
+      changedFiles.add(file);
+    }
+    for (const file of Array.isArray(commit?.modified) ? commit.modified : []) {
+      changedFiles.add(file);
+    }
+  }
+
+  for (const file of changedFiles) {
+    if (typeof file !== 'string' || file.includes('/')) {
+      continue;
+    }
+
+    const name = file.toLowerCase();
+
+    if (name.startsWith('readme')) {
+      signals.hasReadme = true;
+    }
+    if (name.includes('demo') || name.endsWith('.mp4') || name.endsWith('.mov')) {
+      signals.hasVideo = true;
+    }
+    if (name.includes('slides') || name.endsWith('.pdf') || name.endsWith('.pptx')) {
+      signals.hasPresentation = true;
+    }
+  }
+
+  return signals;
+}
+
+/**
+ * Trust the API snapshot when available. Fall back to files changed in the
+ * push only for fields the API could not read, so an API failure no longer
+ * turns an existing YES into NO.
+ */
+function mergeInspection(metrics, inspection, body) {
+  const signals = detectPayloadSignals(body);
+
+  if (inspection.hasReadme !== null) {
+    metrics.hasReadme = inspection.hasReadme;
+  } else if (signals.hasReadme) {
+    metrics.hasReadme = true;
+  }
+
+  if (inspection.hasVideo !== null) {
+    metrics.hasVideo = inspection.hasVideo;
+  } else if (signals.hasVideo) {
+    metrics.hasVideo = true;
+  }
+
+  if (inspection.hasPresentation !== null) {
+    metrics.hasPresentation = inspection.hasPresentation;
+  } else if (signals.hasPresentation) {
+    metrics.hasPresentation = true;
+  }
+}
+
+/**
+ * Check if specific files or metadata exist in the repository.
+ * Returns null for any value Octokit could not determine, so callers
+ * can preserve the previous state instead of reporting a false NO.
  */
 async function inspectRepository(owner, repo) {
-  let hasReadme = false;
-  let hasVideo = false;
-  let hasPresentation = false;
+  const inspection = {
+    hasReadme: null,
+    hasVideo: null,
+    hasPresentation: null,
+  };
+
+  let rootFiles = null;
 
   try {
     // 1. Check for README
     const readmeRes = await octokit.rest.repos.getReadme({ owner, repo });
-    if (readmeRes.data && readmeRes.data.size > 0) {
-      hasReadme = true;
-    }
+    inspection.hasReadme = Boolean(readmeRes.data && readmeRes.data.size > 0);
   } catch (err) {
-    hasReadme = false;
+    if (err.status !== 404) {
+      console.error(
+        `[GitHub] README check failed for ${owner}/${repo}: ${err.status || 'unknown'} ${err.message}`
+      );
+    }
   }
 
   try {
     // 2. Scan repository root files for video or presentation links/files
     const contentsRes = await octokit.rest.repos.getContent({ owner, repo, path: '' });
     if (Array.isArray(contentsRes.data)) {
-      const fileNames = contentsRes.data.map((f) => f.name.toLowerCase());
+      rootFiles = contentsRes.data.map((file) => file.name.toLowerCase());
 
-      hasVideo = fileNames.some(
+      inspection.hasVideo = rootFiles.some(
         (name) => name.includes('demo') || name.endsWith('.mp4') || name.endsWith('.mov')
       );
-      hasPresentation = fileNames.some(
+      inspection.hasPresentation = rootFiles.some(
         (name) => name.includes('slides') || name.endsWith('.pdf') || name.endsWith('.pptx')
       );
     }
   } catch (err) {
-    console.error(`Error reading repo contents for ${repo}:`, err.message);
+    console.error(
+      `[GitHub] Contents check failed for ${owner}/${repo}: ${err.status || 'unknown'} ${err.message}`
+    );
   }
 
-  return { hasReadme, hasVideo, hasPresentation };
+  // If the repo is readable but getReadme returned 404, use the root listing
+  // to distinguish "no README" from "repo not accessible".
+  if (inspection.hasReadme === null && rootFiles) {
+    inspection.hasReadme = rootFiles.some((name) => name.startsWith('readme'));
+  }
+
+  return inspection;
 }
 
 // GitHub Webhook Endpoint
@@ -132,11 +302,6 @@ app.post('/api/github-webhook', async (req, res) => {
     return res.status(200).json({ status: 'ignored', event: event || 'unknown' });
   }
 
-  if (hasProcessedDelivery(deliveryId)) {
-    console.log(`[GitHub Webhook] Duplicate delivery ignored: ${deliveryId}`);
-    return res.status(200).json({ status: 'duplicate' });
-  }
-
   let body;
   try {
     body = normalizePayload(req);
@@ -156,6 +321,7 @@ app.post('/api/github-webhook', async (req, res) => {
   }
 
   const commitsCount = Array.isArray(body.commits) ? body.commits.length : 0;
+  const isDuplicate = hasProcessedDelivery(deliveryId);
 
   try {
     console.log(
@@ -177,16 +343,29 @@ app.post('/api/github-webhook', async (req, res) => {
       };
     }
 
-    teamMetrics[repoFullName].totalCommits += commitsCount;
-    teamMetrics[repoFullName].hasReadme = inspection.hasReadme;
-    teamMetrics[repoFullName].hasVideo = inspection.hasVideo;
-    teamMetrics[repoFullName].hasPresentation = inspection.hasPresentation;
-    teamMetrics[repoFullName].lastUpdated = new Date().toISOString();
+    const metrics = teamMetrics[repoFullName];
+    mergeInspection(metrics, inspection, body);
+
+    // A retried delivery can repair stale flags (for example after token
+    // access changes) without double-counting commits.
+    if (isDuplicate) {
+      console.log(
+        `[GitHub Webhook] Duplicate delivery ${deliveryId}; refreshed artifact flags only`
+      );
+      persistState();
+      broadcastMetrics();
+      return res.status(200).json({ status: 'duplicate' });
+    }
+
+    metrics.totalCommits += commitsCount;
+    metrics.lastUpdated = new Date().toISOString();
 
     rememberDelivery(deliveryId);
 
+    persistState();
+
     // Broadcast live event to frontend dashboard
-    io.emit('metrics-updated', teamMetrics);
+    broadcastMetrics();
 
     return res.status(200).json({ status: 'success' });
   } catch (err) {
@@ -203,7 +382,7 @@ app.get('/api/metrics', (req, res) => {
 // Real-Time Socket Connection
 io.on('connection', (socket) => {
   console.log('Dashboard client connected:', socket.id);
-  socket.emit('metrics-updated', teamMetrics);
+  socket.emit('metrics-updated', buildMetricsPayload());
 });
 
 const PORT = process.env.PORT || 3000;
